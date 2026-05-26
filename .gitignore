@@ -161,3 +161,4 @@ cython_debug/
 devices.xml
 *.png
 *.jpg
+to_print.txt
