@@ -1,3 +1,7 @@
+# Quick Start
+
+uv run python3 printlabel.py /dev/tty.PT-P300BT7912 Roboto_Condensed-Bold -B to_print.txt
+
 # Printing to a Brother P-Touch Cube PT-P300BT label printer from a computer
 
 A Python-based label printing utility designed for Brother PT-P300BT thermal label printers. This program creates custom labels with text, images, and advanced formatting options, automatically optimizing content to fit within the printer's specifications.
@@ -186,7 +190,7 @@ python printlabel.py -sln --stroke-width 1 --fill-color="white" --stroke-fill="b
 
 ```
 git clone https://github.com/Ircama/PT-P300BT && cd PT-P300BT
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Code dependency structure
@@ -199,7 +203,7 @@ graph LR
     labelmaker.py --> ptstatus.py
 
     subgraph Project_Support_Files[Project Support Files]
-        requirements[requirements.txt]
+        pyproject[pyproject.toml]
         spec[printlabel.spec]
         readme[README.md]
     end

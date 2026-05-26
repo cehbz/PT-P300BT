@@ -1,0 +1,16 @@
+[project]
+name = "pt-p300bt"
+version = "0.1.0"
+description = "Brother PT-P300BT label printer utility"
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial",
+    "pillow",
+    "packbits",
+    "pdf2image",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
