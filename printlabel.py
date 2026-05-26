@@ -37,6 +37,14 @@ def set_args():
         help='Use fixed font size (disables auto-sizing to fit printable area)'
     )
     p.add_argument(
+        '-W', '--max-width',
+        type=float,
+        default=None,
+        metavar='MILLIMETERS',
+        help='Cap label width in mm. In batch mode, picks one uniform font size '
+             'that fits every label within this width.'
+    )
+    p.add_argument(
         '-v', '--verbose',
         action='store_true',
         help='Print per-frame status diagnostics during printing.'
@@ -397,6 +405,37 @@ def fit_font_size(fontname, text_lines, max_width_px=None,
     return (best_size, best_spacing)
 
 
+def pick_uniform_font_size(fontname, labels, max_width_mm,
+                           base_line_spacing=1.2, height_limit=64, p=None):
+    """Find the largest font_size where every label fits within
+    (max_width_mm, height_limit). Errors via p.error (or raises ValueError if
+    p is None) when any label doesn't fit at any size >= 1.
+    Returns (font_size, line_spacing) for uniform rendering.
+    """
+    max_width_px = int(max_width_mm / 0.149)
+    sizes = []
+    spacings = []
+    for text in labels:
+        text_lines = (text.replace("\\n", "\n").split('\n')
+                      if '\\n' in text else [text])
+        size, spacing = fit_font_size(
+            fontname, text_lines,
+            max_width_px=max_width_px,
+            base_line_spacing=base_line_spacing,
+            height_limit=height_limit,
+        )
+        if size == 0:
+            msg = (f'Label "{text}" does not fit at any font size '
+                   f'within {max_width_mm}mm width')
+            if p is not None:
+                p.error(msg)
+            else:
+                raise ValueError(msg)
+        sizes.append(size)
+        spacings.append(spacing)
+    return min(sizes), min(spacings)
+
+
 def render_label(args, text, p):
     """Render a text label to binary image data ready for the printer."""
     height_of_the_printable_area = 64  # px: number of vertical pixels of the PT-P300BT printer (9 mm)
@@ -429,9 +468,10 @@ def render_label(args, text, p):
                     print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")
             else:
                 original_spacing = args.line_spacing
+                max_width_px = int(args.max_width / 0.149) if args.max_width else None
                 font_size, args.line_spacing = fit_font_size(
                     args.fontname, text_lines,
-                    max_width_px=None,
+                    max_width_px=max_width_px,
                     base_line_spacing=args.line_spacing,
                     height_limit=height_of_the_printable_area,
                 )
@@ -521,9 +561,10 @@ def render_label(args, text, p):
                 if font_height > height_of_the_printable_area:
                     print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")
             else:
+                max_width_px = int(args.max_width / 0.149) if args.max_width else None
                 font_size, _ = fit_font_size(
                     args.fontname, [text],
-                    max_width_px=None,
+                    max_width_px=max_width_px,
                     base_line_spacing=args.line_spacing,
                     height_limit=height_of_the_printable_area,
                 )
@@ -784,6 +825,9 @@ def main():
     if args.comport not in [p.device for p in list_ports.comports()]:
         print("Port '" + args.comport + "' does not seem a valid serial communication port.")
 
+    if args.max_width and args.text_size:
+        p.error("--max-width and --text-size are incompatible (one caps width, the other stretches to width)")
+
     if args.batch_file:
         # Batch mode: read labels from file, render all, then print in one session
         with open(args.batch_file) as f:
@@ -791,6 +835,15 @@ def main():
 
         if not labels:
             p.error(f'No labels found in "{args.batch_file}".')
+
+        if args.max_width and not args.fixed_font_size:
+            uniform_size, uniform_spacing = pick_uniform_font_size(
+                args.fontname, labels, args.max_width,
+                base_line_spacing=args.line_spacing, p=p,
+            )
+            args.fixed_font_size = uniform_size
+            args.line_spacing = uniform_spacing
+            print(f"Uniform font size for batch: {uniform_size} (line spacing {uniform_spacing:.2f})")
 
         print(f"Rendering {len(labels)} labels...")
         rendered = []

@@ -72,8 +72,10 @@ python printlabel.py -sl COM3 arial.ttf "Line 1\nLine 2\nLine 3"
 ## Command Line Arguments
 
 ```
-usage: printlabel.py [-h] [-u] [-l] [-s] [-c] [-i FILE_NAME] [-M FILE_NAME] [-R FLOAT]
-                     [-X DOTS] [-Y DOTS] [-S FILE_NAME] [-n] [-F] [-a] [-m DOTS] [-r] [-C]
+usage: printlabel.py [-h] [--fixed-width MILLIMETERS] [--fixed-font-size SIZE]
+                     [-W MILLIMETERS] [-B FILE] [-u] [-l] [-s] [-c]
+                     [-i FILE_NAME] [-M FILE_NAME] [-R FLOAT] [-X DOTS] [-Y DOTS]
+                     [-S FILE_NAME] [-n] [-F] [-a] [-m DOTS] [-r] [-C]
                      [--fill-color FILL] [--stroke-fill STROKE_FILL]
                      [--stroke-width STROKE_WIDTH] [--text-size MILLIMETERS]
                      [--font-scale NUMBER] [--h-padding DOTS] [--v-shift DOTS]
@@ -91,6 +93,21 @@ Optional arguments:
 
 ```
   -h, --help            show this help message and exit
+  --fixed-width MILLIMETERS
+                        Pad label to exact width in mm (adds whitespace if text is
+                        shorter).
+  --fixed-font-size SIZE
+                        Use fixed font size (disables auto-sizing to fit printable
+                        area).
+  -W, --max-width MILLIMETERS
+                        Cap label width in mm. In batch mode (-B), picks one uniform
+                        font size that fits every label within this width and errors
+                        if any label can't fit at any size. Incompatible with
+                        --text-size.
+  -B, --batch-file FILE
+                        Print multiple labels from a file (one label per line). Uses
+                        chain printing to minimize tape waste. Each line uses \n for
+                        line breaks within a label.
   -u, --unicode         Use Unicode escape sequences in TEXT_TO_PRINT.
   -l, --lines           Add horizontal lines for drawing area (dotted red) and tape
                         (cyan).
@@ -167,6 +184,12 @@ Same as the happy-sun.png example, but resizing the text so that its length is a
 
 ```bash
 python printlabel.py -sl -M resources/happy-sun.png COM7 --text-size 70 --end-margin 10 "micross.ttf" "lorem ipsum dolor sit amet"
+```
+
+Batch printing with uniform font sizing (one label per line in `labels.txt`, capped at 50mm wide):
+
+```bash
+uv run python3 printlabel.py /dev/tty.PT-P300BT7912 Roboto_Condensed-Bold -B labels.txt -W 50
 ```
 
 Examples of usage of Unicode escape sequences:
