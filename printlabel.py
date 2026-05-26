@@ -8,6 +8,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 
 from labelmaker import do_print_job, reset_printer
+import ptcbp
+import ptstatus
     
 
 def set_args():
@@ -28,11 +30,16 @@ def set_args():
         metavar='MILLIMETERS',  
         help='Pad label to exact width in mm (adds whitespace if text is shorter).'  
     )
-    p.add_argument(  
-        '--fixed-font-size',  
-        type=int,  
-        metavar='SIZE',  
-        help='Use fixed font size (disables auto-sizing to fit printable area)'  
+    p.add_argument(
+        '--fixed-font-size',
+        type=int,
+        metavar='SIZE',
+        help='Use fixed font size (disables auto-sizing to fit printable area)'
+    )
+    p.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Print per-frame status diagnostics during printing.'
     )
     p.add_argument(
         'fontname',
@@ -45,6 +52,13 @@ def set_args():
         metavar='TEXT_TO_PRINT',
         nargs='*',
         help='Text to be printed. UTF8 characters are accepted. Use \\n for line breaks.'
+    )
+    p.add_argument(
+        '-B', '--batch-file',
+        metavar='FILE',
+        help='Print multiple labels from a file (one label per line). '
+             'Uses chain printing to minimize tape waste. '
+             'Each line uses \\\\n for line breaks within a label.'
     )
     p.add_argument(
         '-u', '--unicode',
@@ -169,10 +183,10 @@ def set_args():
     p.add_argument(
         '--h-padding',
         type=int,
-        default=5,
+        default=20,
         metavar='DOTS',
         help='Define custom left and right horizontal padding in pixels'
-        ' (default: 5 pixels left and 5 pixels right)'
+        ' (default: 20 pixels left and 20 pixels right)'
     )
     p.add_argument(
         '--v-shift',
@@ -343,441 +357,497 @@ def draw_multiline_text(
 
 
 
+def fit_font_size(fontname, text_lines, max_width_px=None,
+                  base_line_spacing=1.2, height_limit=64):
+    """Return (font_size, line_spacing) for the largest size where text fits.
+
+    Grows font_size from 1 upward. At each size, measures text via
+    calculate_multiline_dimensions. Stops when height exceeds height_limit or
+    width exceeds max_width_px. For multi-line text, attempts to tighten
+    line_spacing (down to 90% of base) before giving up on a candidate size.
+    Returns (0, base_line_spacing) if no size >= 1 fits.
+    """
+    best_size = 0
+    best_spacing = base_line_spacing
+    size = 0
+    while size < 200:
+        size += 1
+        font = ImageFont.truetype(fontname, size, encoding='utf-8')
+        w, h, _ = calculate_multiline_dimensions(text_lines, font, base_line_spacing)
+
+        if h > height_limit:
+            if len(text_lines) > 1:
+                min_spacing = base_line_spacing * 0.9
+                spacing = base_line_spacing
+                while spacing > min_spacing:
+                    spacing -= 0.01
+                    w2, h2, _ = calculate_multiline_dimensions(text_lines, font, spacing)
+                    if h2 <= height_limit:
+                        if max_width_px is None or w2 <= max_width_px:
+                            best_size = size
+                            best_spacing = spacing
+                        return (best_size, best_spacing)
+            return (best_size, best_spacing)
+
+        if max_width_px is not None and w > max_width_px:
+            return (best_size, best_spacing)
+
+        best_size = size
+        best_spacing = base_line_spacing
+    return (best_size, best_spacing)
+
+
+def render_label(args, text, p):
+    """Render a text label to binary image data ready for the printer."""
+    height_of_the_printable_area = 64  # px: number of vertical pixels of the PT-P300BT printer (9 mm)
+    height_of_the_tape = 86  # 64 px / 9 mm * 12 mm (the borders over the printable area will not be printed)
+    height_of_the_image = 88  # px (can be any value >= height_of_the_tape, but height_of_the_tape + 2 border lines is good)
+
+    # Compute max TT font size to remain within height_of_the_printable_area
+    font_size = 0
+    font_height = 0
+    font = None
+    print_border = (height_of_the_image - height_of_the_printable_area) / 2
+    if text:
+        if args.unicode:
+            text = text.encode().decode('unicode_escape')
+
+        # Check if text contains newlines to determine processing mode
+        has_newlines = '\\n' in text
+
+        if has_newlines:
+            # Split text into lines for multiline processing
+            text_lines = text.replace("\\n", "\n").split('\n')
+
+            if args.fixed_font_size:
+                font_size = args.fixed_font_size
+                font = ImageFont.truetype(args.fontname, font_size, encoding='utf-8')
+                font_width, font_height, line_heights = calculate_multiline_dimensions(
+                    text_lines, font, args.line_spacing
+                )
+                if font_height > height_of_the_printable_area:
+                    print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")
+            else:
+                original_spacing = args.line_spacing
+                font_size, args.line_spacing = fit_font_size(
+                    args.fontname, text_lines,
+                    max_width_px=None,
+                    base_line_spacing=args.line_spacing,
+                    height_limit=height_of_the_printable_area,
+                )
+                if font_size == 0:
+                    p.error(f'Text "{text}" does not fit at any font size')
+                if args.line_spacing < original_spacing:
+                    print(
+                        f"Line spacing has been slightly decreased to fit "
+                        f"the printable area. Used value: {args.line_spacing:.2f}."
+                    )
+                try:
+                    font = ImageFont.truetype(
+                        args.fontname, font_size, encoding='utf-8'
+                    )
+                except Exception as e:
+                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font_width, font_height, line_heights = calculate_multiline_dimensions(
+                    text_lines, font, args.line_spacing
+                )
+
+            y_position = print_border
+            if args.font_scale:
+                scaled_font_size = int(
+                    round(font_size * (args.font_scale / 100.0))
+                )
+                try:
+                    font = ImageFont.truetype(
+                        args.fontname, scaled_font_size, encoding='utf-8'
+                    )
+                except Exception as e:
+                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+
+                # Recalculate dimensions with scaled font
+                font_width, font_height, line_heights = calculate_multiline_dimensions(
+                    text_lines, font, args.line_spacing
+                )
+
+                # Vertically center text
+                y_position = print_border + (
+                    height_of_the_printable_area - font_height
+                ) // 2
+
+            # Create a drawing context for the image
+            image = Image.new(
+                "RGB",
+                (
+                    font_width + args.h_padding * 2 + 1 + args.end_margin,
+                    height_of_the_image
+                ),
+                "white"
+            )
+            draw = ImageDraw.Draw(image)
+            try:
+                # Draw multiline text
+                draw_multiline_text(
+                    draw, text_lines, args.h_padding, y_position + args.v_shift,
+                    font, args.fill, args.stroke_width, args.stroke_fill, args.line_spacing,
+                    args.center_text, image.width
+                )
+            except Exception as e:
+                p.error(f"Invalid parameter: {e}")
+
+            if args.text_size:
+                text_size = (
+                    int(args.text_size / 0.149)
+                    - args.h_padding
+                    - args.end_margin
+                )  # mm to dot
+
+                # For multiline text, use the width of the widest line for scaling
+                scale_factor = font_width / text_size
+                image = image.transform(
+                    (text_size + args.end_margin + args.h_padding, height_of_the_image),
+                    Image.Transform.AFFINE,
+                    (scale_factor, 0, 0, 0, 1, 0),
+                )
+                while image.getpixel((image.width - 1, 0)) == (0, 0, 0):
+                    crop_box = (0, 0, image.width - 1, height_of_the_image)
+                    image = image.crop(crop_box)
+                draw = ImageDraw.Draw(image)
+        else:
+            # Single-line processing
+            if args.fixed_font_size:
+                font_size = args.fixed_font_size
+                font = ImageFont.truetype(args.fontname, font_size, encoding='utf-8')
+                font_width, font_height = font.getbbox(text, anchor="lt")[2:]
+                if font_height > height_of_the_printable_area:
+                    print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")
+            else:
+                font_size, _ = fit_font_size(
+                    args.fontname, [text],
+                    max_width_px=None,
+                    base_line_spacing=args.line_spacing,
+                    height_limit=height_of_the_printable_area,
+                )
+                if font_size == 0:
+                    p.error(f'Text "{text}" does not fit at any font size')
+                try:
+                    font = ImageFont.truetype(
+                        args.fontname, font_size, encoding='utf-8'
+                    )
+                except Exception as e:
+                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font_width, font_height = font.getbbox(text, anchor="lt")[2:]
+
+            y_position = print_border
+            if args.font_scale:
+                scaled_font_size = int(
+                    round(font_size * (args.font_scale / 100.0))
+                )
+                try:
+                    font = ImageFont.truetype(
+                        args.fontname, scaled_font_size, encoding='utf-8'
+                    )
+                except Exception as e:
+                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font_width, font_height = font.getbbox(text, anchor="lt")[2:]
+
+                # Vertically center text
+                y_position = print_border + (
+                    height_of_the_printable_area - font_height
+                ) // 2
+
+            # Create a drawing context for the image
+            image = Image.new(
+                "RGB",
+                (
+                    font_width + args.h_padding * 2 + 1 + args.end_margin,
+                    height_of_the_image
+                ),
+                "white"
+            )
+            draw = ImageDraw.Draw(image)
+            try:
+                draw.text(
+                    (args.h_padding, y_position + args.v_shift), text,
+                    font=font,
+                    fill=args.fill,
+                    anchor="lt",
+                    stroke_width=args.stroke_width,
+                    stroke_fill=args.stroke_fill
+                )
+            except Exception as e:
+                p.error(f"Invalid parameter: {e}")
+            if args.text_size:
+                text_size = (
+                    int(args.text_size / 0.149)
+                    - args.h_padding
+                    - args.end_margin
+                )  # mm to dot
+                _, _, text_width, text_height = draw.textbbox(
+                    (0, 0), text,
+                    anchor="lt",
+                    font=font,
+                    stroke_width=args.stroke_width,
+                )
+                scale_factor = text_width / text_size
+                image = image.transform(
+                    (text_size + args.end_margin + args.h_padding, height_of_the_image),
+                    Image.Transform.AFFINE,
+                    (scale_factor, 0, 0, 0, 1, 0),
+                )
+                while image.getpixel((image.width - 1, 0)) == (0, 0, 0):
+                    crop_box = (0, 0, image.width - 1, height_of_the_image)
+                    image = image.crop(crop_box)
+                draw = ImageDraw.Draw(image)
+    else:  # null image
+        image = Image.new(
+            "RGB",
+            (0, height_of_the_image),
+            "white"
+        )
+        draw = ImageDraw.Draw(image)
+
+    if not args.fixed_font_size:
+        print("Font size determined:", font_size)
+    if args.merge:
+        for i in reversed(args.merge):
+            loaded_image = process_image(
+                i,
+                args.resize,
+                white_level=args.white_level,
+                target_height=height_of_the_printable_area
+            )
+            if not loaded_image:
+                p.error(f'Invalid image "{i}"')
+            dst = Image.new(
+                "RGB",
+                (loaded_image.width + image.width, height_of_the_image),
+                "white"
+            )
+            dst.paste(loaded_image, (args.x_merge, args.y_merge))
+            dst.paste(image, (loaded_image.width, 0))
+            image = dst
+        # Convert the image to binary
+        draw = ImageDraw.Draw(image)
+
+    if args.fixed_width:
+        target_width_dots = int(round(args.fixed_width / 0.149))
+        current_width = image.width
+        if current_width < target_width_dots:
+            # Create a new white image of target width and paste the existing image centered or left-aligned
+            padded_image = Image.new("RGB", (target_width_dots, image.height), "white")
+            # Example: left-aligned paste; change x_offset for centering
+            x_offset = 0
+            padded_image.paste(image, (x_offset, 0))
+            image = padded_image
+
+    if args.lines:
+        # Draw ruler (in)
+        draw.text(
+            (0, 1), "in",
+            anchor="la",
+            fill="magenta"
+        )
+        x = -1
+        i = 0
+        while x < image.width:
+            if x > 0:
+                draw.line(  # top
+                    (
+                        int(x), print_border - (4 if i % 4 else 9),
+                        int(x), print_border - 2
+                    ),
+                    fill="magenta", width=2
+                )
+            x += 43.18
+            i += 1
+        # Draw ruler (cm)
+        draw.text(
+            (0, 76), "cm",
+            anchor="la",
+            fill="magenta"
+        )
+        x = -1
+        i = 0
+        while x < image.width:
+            if x > 0:
+                draw.line(
+                    (
+                        int(x), height_of_the_image - print_border + 1,
+                        int(x), height_of_the_image - print_border
+                        + (5 if i % 10 else 9)
+                    ),
+                    fill="magenta", width=2
+                )
+            x += 68
+            i += 1
+        # Draw a dotted horizontal line over the top border and below the bottom border of the printable area
+        for x in range(0, image.width, 5):
+            draw.line(  # top
+                (x, print_border - 1, x + 1, print_border - 1),
+                fill="red", width=1
+            )
+            draw.line(
+                (  # bottom
+                    x, height_of_the_image - print_border,
+                    x + 1, height_of_the_image - print_border
+                ),
+                fill="red", width=1
+            )
+        # Draw a cyan line showing the tape borders
+        tape_border = int((height_of_the_image - height_of_the_tape) / 2)
+        if tape_border > 0:
+            draw.line(
+                (0, tape_border - 1, image.width, tape_border - 1),
+                fill="cyan", width=1
+            )
+            draw.line(
+                (
+                    0, height_of_the_image - tape_border,
+                    image.width, height_of_the_image - tape_border
+                ),
+                fill="cyan", width=1
+            )
+
+    # Convert to greyscale and rotate/invert/mirror the image
+    rotated_image = ImageOps.invert(
+        image.convert('L', dither=Image.Dither.FLOYDSTEINBERG)
+        .rotate(-90, expand=True, resample=Image.BICUBIC)
+    )
+    rotated_image = ImageOps.mirror(rotated_image)
+
+    # Manual binarization with a threshold (smoother control of artifacts)
+    bin_image = rotated_image.point(lambda p: p > args.threshold and 255)
+
+    # Convert to '1' mode (binary image)
+    binary_img = bin_image.convert('1')
+
+    # Add padding to increase the height from height_of_the_image to 128
+    # (similar to the last part of read_png() code in labelmaker_encode.py)
+    w, h = binary_img.size
+    padded = Image.new('1', (128, h))
+    x, y = (128 - w) // 2, 0
+    nw, nh = x + w, y + h
+    padded.paste(binary_img, (x, y, nw, nh))
+
+    if not image.tobytes():
+        p.error("Null image generated.")
+
+    # Compute tape length and print duration
+    print_length = padded.size[1] * 0.149  # mm
+    print(
+        "Length of the printed tape:",
+        "%.1f" % (print_length / 10),
+        "cm = %.1f" % (print_length / 10 / 2.54),
+        "in, printed in",
+        "%.1f" % (print_length / 20),
+        "sec."
+    )
+    print_length += (25 + 1)  # 2.5 cm of wasted tape before, 1 mm after
+    print(
+        "Length of the used tape (adding header and footer):",
+        "%.1f" % (print_length / 10),
+        "cm = %.1f" % (print_length / 10 / 2.54),
+        "in, printed in",
+        "%.1f" % (print_length / 20),
+        "sec."
+    )
+
+    # Check max tape length
+    if print_length > 499:
+        print("Print length exceeding 49.9 cm = 19.6 in")
+        quit()
+
+    # Image save and show
+    if args.save:
+        print(f'Saving image "{args.save}".')
+        image.save(args.save)
+        if args.no_print:
+            quit()
+    if args.show:
+        try:
+            image.show()
+        except Exception as e:
+            p.error("Cannot show image:" + repr(e))
+        if not args.show_conv and args.no_print:
+            quit()
+    if args.show_conv:
+        padded.show()
+        if args.no_print:
+            quit()
+
+    return padded.tobytes()
+
+
 def main():
     p = set_args()
     args = p.parse_args()
     if args.comport not in [p.device for p in list_ports.comports()]:
-        print("Port '" + args.comport + "' does not seem a valid serial communication port.")        
-    data = None
-    if args.image is None: # not using the legacy mode
-        height_of_the_printable_area = 64  # px: number of vertical pixels of the PT-P300BT printer (9 mm)
-        height_of_the_tape = 86  # 64 px / 9 mm * 12 mm (the borders over the printable area will not be printed)
-        height_of_the_image = 88  # px (can be any value >= height_of_the_tape, but height_of_the_tape + 2 border lines is good)
+        print("Port '" + args.comport + "' does not seem a valid serial communication port.")
 
-        # Compute max TT font size to remain within height_of_the_printable_area
-        font_size = 0
-        font_height = 0
-        font = None
-        print_border = (height_of_the_image - height_of_the_printable_area) / 2
-        text = " ".join(args.text_to_print)
-        if text:
-            if args.unicode:
-                text = text.encode().decode('unicode_escape')
-            
-            # Check if text contains newlines to determine processing mode
-            has_newlines = '\\n' in text
+    if args.batch_file:
+        # Batch mode: read labels from file, render all, then print in one session
+        with open(args.batch_file) as f:
+            labels = [line.rstrip('\n') for line in f if line.strip()]
 
-            if has_newlines:
-                # Split text into lines for multiline processing
-                text_lines = text.replace("\\n", "\n").split('\n')
+        if not labels:
+            p.error(f'No labels found in "{args.batch_file}".')
 
-                if args.fixed_font_size:
-                    font_size = args.fixed_font_size  
-                    font = ImageFont.truetype(args.fontname, font_size, encoding='utf-8')  
-                    font_width, font_height, line_heights = calculate_multiline_dimensions(  
-                        text_lines, font, args.line_spacing  
-                    )  
-                    if font_height > height_of_the_printable_area:  
-                        print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")  
-                else:
-                    stop = False
-                    while font_height != height_of_the_printable_area:
-                        if font_height > height_of_the_printable_area:
-                            # Try to slightly decrease line_spacing
-                            if len(text_lines) > 1:
-                                min_spacing = args.line_spacing * 0.9  # Don't go below this multiplier
-                                spacing_step = 0.01
-                                new_spacing = args.line_spacing
-                                found_fit = False
-                                while new_spacing > min_spacing:
-                                    new_spacing -= spacing_step
-                                    font_width2, font_height2, _ = calculate_multiline_dimensions(
-                                        text_lines, font, new_spacing
-                                    )
-                                    if font_height2 == height_of_the_printable_area:
-                                        # Found a fit, update spacing and dimensions
-                                        args.line_spacing = new_spacing
-                                        print(
-                                            f"Line spacing has been slightly decreased "
-                                            f"to fit the printable area. Used value: {new_spacing:.2f}."
-                                        )
-                                        font_width, font_height = font_width2, font_height2
-                                        found_fit = True
-                                        break
-                                if found_fit:
-                                    break
-                            # If not multiline or can't fit by spacing, decrease font size
-                            font_size -= 1
-                            stop = True
-                        else:
-                            font_size += 1
-                        try:
-                            font = ImageFont.truetype(
-                                args.fontname, font_size, encoding='utf-8'
-                            )
-                        except Exception as e:
-                            p.error(f'Cannot load font "{args.fontname}" - {e}')
-                        
-                        # Calculate dimensions for multiline text
-                        font_width, font_height, line_heights = calculate_multiline_dimensions(
-                            text_lines, font, args.line_spacing
-                        )
-                        
-                        if stop:
-                            print(
-                                "The max height of this text with font "
-                                f'"{args.fontname}" is {font_height} dots'
-                                f' instead of {height_of_the_printable_area}.')
-                            break
+        print(f"Rendering {len(labels)} labels...")
+        rendered = []
+        for i, text in enumerate(labels):
+            print(f"\n--- Label {i+1}/{len(labels)}: {text} ---")
+            data = render_label(args, text, p)
+            rendered.append(data)
 
-                y_position = print_border
-                if args.font_scale:
-                    scaled_font_size = int(
-                        round(font_size * (args.font_scale / 100.0))
-                    )
-                    try:
-                        font = ImageFont.truetype(
-                            args.fontname, scaled_font_size, encoding='utf-8'
-                        )
-                    except Exception as e:
-                        p.error(f'Cannot load font "{args.fontname}" - {e}')
-                    
-                    # Recalculate dimensions with scaled font
-                    font_width, font_height, line_heights = calculate_multiline_dimensions(
-                        text_lines, font, args.line_spacing
-                    )
-
-                    # Vertically center text
-                    y_position = print_border + (
-                        height_of_the_printable_area - font_height
-                    ) // 2
-
-                # Create a drawing context for the image
-                image = Image.new(
-                    "RGB",
-                    (
-                        font_width + args.h_padding * 2 + 1 + args.end_margin,
-                        height_of_the_image
-                    ),
-                    "white"
-                )
-                draw = ImageDraw.Draw(image)
-                try:
-                    # Draw multiline text
-                    draw_multiline_text(
-                        draw, text_lines, args.h_padding, y_position + args.v_shift,
-                        font, args.fill, args.stroke_width, args.stroke_fill, args.line_spacing,
-                        args.center_text, image.width
-                    )
-                except Exception as e:
-                    p.error(f"Invalid parameter: {e}")
-                
-                if args.text_size:
-                    text_size = (
-                        int(args.text_size / 0.149)
-                        - args.h_padding
-                        - args.end_margin
-                    )  # mm to dot
-                    
-                    # For multiline text, use the width of the widest line for scaling
-                    scale_factor = font_width / text_size
-                    image = image.transform(
-                        (text_size + args.end_margin + args.h_padding, height_of_the_image),
-                        Image.Transform.AFFINE,
-                        (scale_factor, 0, 0, 0, 1, 0),
-                    )
-                    while image.getpixel((image.width - 1, 0)) == (0, 0, 0):
-                        crop_box = (0, 0, image.width - 1, height_of_the_image)
-                        image = image.crop(crop_box)
-                    draw = ImageDraw.Draw(image)
-            else:
-                # Single-line processing
-                if args.fixed_font_size:  
-                    font_size = args.fixed_font_size  
-                    font = ImageFont.truetype(args.fontname, font_size, encoding='utf-8')  
-                    font_width, font_height = font.getbbox(text, anchor="lt")[2:]  
-                    if font_height > height_of_the_printable_area:  
-                        print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")  
-                else:
-                    stop = False
-                    while font_height != height_of_the_printable_area:
-                        if font_height > height_of_the_printable_area:
-                            font_size -= 1
-                            stop = True
-                        else:
-                            font_size += 1
-                        try:
-                            font = ImageFont.truetype(
-                                args.fontname, font_size, encoding='utf-8'
-                            )
-                        except Exception as e:
-                            p.error(f'Cannot load font "{args.fontname}" - {e}')
-                        font_width, font_height = font.getbbox(text, anchor="lt")[2:]
-                        if stop:
-                            print(
-                                "The max height of this text with font "
-                                f'"{args.fontname}" is {font_height} dots'
-                                f' instead of {height_of_the_printable_area}.')
-                            break
-
-                y_position = print_border
-                if args.font_scale:
-                    scaled_font_size = int(
-                        round(font_size * (args.font_scale / 100.0))
-                    )
-                    try:
-                        font = ImageFont.truetype(
-                            args.fontname, scaled_font_size, encoding='utf-8'
-                        )
-                    except Exception as e:
-                        p.error(f'Cannot load font "{args.fontname}" - {e}')
-                    font_width, font_height = font.getbbox(text, anchor="lt")[2:]
-
-                    # Vertically center text
-                    y_position = print_border + (
-                        height_of_the_printable_area - font_height
-                    ) // 2
-
-                # Create a drawing context for the image
-                image = Image.new(
-                    "RGB",
-                    (
-                        font_width + args.h_padding * 2 + 1 + args.end_margin,
-                        height_of_the_image
-                    ),
-                    "white"
-                )
-                draw = ImageDraw.Draw(image)
-                try:
-                    draw.text(
-                        (args.h_padding, y_position + args.v_shift), text,
-                        font=font,
-                        fill=args.fill,
-                        anchor="lt",
-                        stroke_width=args.stroke_width,
-                        stroke_fill=args.stroke_fill
-                    )
-                except Exception as e:
-                    p.error(f"Invalid parameter: {e}")
-                if args.text_size:
-                    text_size = (
-                        int(args.text_size / 0.149)
-                        - args.h_padding
-                        - args.end_margin
-                    )  # mm to dot
-                    _, _, text_width, text_height = draw.textbbox(
-                        (0, 0), text,
-                        anchor="lt",
-                        font=font,
-                        stroke_width=args.stroke_width,
-                    )
-                    scale_factor = text_width / text_size
-                    image = image.transform(
-                        (text_size + args.end_margin + args.h_padding, height_of_the_image),
-                        Image.Transform.AFFINE,
-                        (scale_factor, 0, 0, 0, 1, 0),
-                    )
-                    while image.getpixel((image.width - 1, 0)) == (0, 0, 0):
-                        crop_box = (0, 0, image.width - 1, height_of_the_image)
-                        image = image.crop(crop_box)
-                    draw = ImageDraw.Draw(image)
-        else:  # null image
-            image = Image.new(
-                "RGB",
-                (0, height_of_the_image),
-                "white"
+        print(f"\n=> Opening printer connection and printing {len(rendered)} labels...")
+        try:
+            ser = serial.Serial(args.comport)
+        except serial.SerialException:
+            p.error(
+                'Printer on Bluetooth serial port "'
+                + args.comport
+                + '" is unavailable or unreachable.'
             )
-            draw = ImageDraw.Draw(image)
+        except Exception as e:
+            p.error(e)
 
-        if not args.fixed_font_size:  
-            print("Font size determined:", font_size)
-        if args.merge:
-            for i in reversed(args.merge):
-                loaded_image = process_image(
-                    i,
-                    args.resize,
-                    white_level=args.white_level,
-                    target_height=height_of_the_printable_area
-                )
-                if not loaded_image:
-                    p.error(f'Invalid image "{i}"')
-                dst = Image.new(
-                    "RGB",
-                    (loaded_image.width + image.width, height_of_the_image),
-                    "white"
-                )
-                dst.paste(loaded_image, (args.x_merge, args.y_merge))
-                dst.paste(image, (loaded_image.width, 0))
-                image = dst
-            # Convert the image to binary
-            draw = ImageDraw.Draw(image)
+        try:
+            for i, data in enumerate(rendered):
+                is_last = (i == len(rendered) - 1)
+                print(f"\n=> Printing label {i+1}/{len(rendered)}...")
+                args.no_feed = not is_last
+                do_print_job(ser, args, data)
+        finally:
+            reset_printer(ser)
+            ser.close()
 
-        if args.fixed_width:  
-            target_width_dots = int(round(args.fixed_width / 0.149))  
-            current_width = image.width  
-            if current_width < target_width_dots:  
-                # Create a new white image of target width and paste the existing image centered or left-aligned  
-                padded_image = Image.new("RGB", (target_width_dots, image.height), "white")  
-                # Example: left-aligned paste; change x_offset for centering  
-                x_offset = 0  
-                padded_image.paste(image, (x_offset, 0))  
-                image = padded_image
+    else:
+        # Single label mode
+        data = None
+        if args.image is None:
+            text = " ".join(args.text_to_print)
+            data = render_label(args, text, p)
+        else:
+            # Legacy image mode handled by labelmaker
+            pass
 
-        if args.lines:
-            # Draw ruler (in)
-            draw.text(
-                (0, 1), "in",
-                anchor="la",
-                fill="magenta"
+        try:
+            ser = serial.Serial(args.comport)
+        except serial.SerialException:
+            p.error(
+                'Printer on Bluetooth serial port "'
+                + args.comport
+                + '" is unavailable or unreachable.'
             )
-            x = -1
-            i = 0
-            while x < image.width:
-                if x > 0:
-                    draw.line(  # top
-                        (
-                            int(x), print_border - (4 if i % 4 else 9),
-                            int(x), print_border - 2
-                        ),
-                        fill="magenta", width=2
-                    )
-                x += 43.18
-                i += 1
-            # Draw ruler (cm)
-            draw.text(
-                (0, 76), "cm",
-                anchor="la",
-                fill="magenta"
-            )
-            x = -1
-            i = 0
-            while x < image.width:
-                if x > 0:
-                    draw.line(
-                        (
-                            int(x), height_of_the_image - print_border + 1,
-                            int(x), height_of_the_image - print_border
-                            + (5 if i % 10 else 9)
-                        ),
-                        fill="magenta", width=2
-                    )
-                x += 68
-                i += 1
-            # Draw a dotted horizontal line over the top border and below the bottom border of the printable area
-            for x in range(0, image.width, 5):
-                draw.line(  # top
-                    (x, print_border - 1, x + 1, print_border - 1),
-                    fill="red", width=1
-                )
-                draw.line(
-                    (  # bottom
-                        x, height_of_the_image - print_border,
-                        x + 1, height_of_the_image - print_border
-                    ),
-                    fill="red", width=1
-                )
-            # Draw a cyan line showing the tape borders
-            tape_border = int((height_of_the_image - height_of_the_tape) / 2)
-            if tape_border > 0:
-                draw.line(
-                    (0, tape_border - 1, image.width, tape_border - 1),
-                    fill="cyan", width=1
-                )
-                draw.line(
-                    (
-                        0, height_of_the_image - tape_border,
-                        image.width, height_of_the_image - tape_border
-                    ),
-                    fill="cyan", width=1
-                )
+        except Exception as e:
+            p.error(e)
 
-        # Convert to greyscale and rotate/invert/mirror the image
-        rotated_image = ImageOps.invert(
-            image.convert('L', dither=Image.Dither.FLOYDSTEINBERG)
-            .rotate(-90, expand=True, resample=Image.BICUBIC)
-        )
-        rotated_image = ImageOps.mirror(rotated_image)
-
-        # Manual binarization with a threshold (smoother control of artifacts)
-        bin_image = rotated_image.point(lambda p: p > args.threshold and 255)
-
-        # Convert to '1' mode (binary image)
-        binary_img = bin_image.convert('1')
-
-        # Add padding to increase the height from height_of_the_image to 128
-        # (similar to the last part of read_png() code in labelmaker_encode.py)
-        w, h = binary_img.size
-        padded = Image.new('1', (128, h))
-        x, y = (128 - w) // 2, 0
-        nw, nh = x + w, y + h
-        padded.paste(binary_img, (x, y, nw, nh))
-        
-        if not image.tobytes():
-            p.error("Null image generated.")
-
-        # Compute tape length and print duration
-        print_length = padded.size[1] * 0.149  # mm
-        print(
-            "Length of the printed tape:",
-            "%.1f" % (print_length / 10),
-            "cm = %.1f" % (print_length / 10 / 2.54),
-            "in, printed in",
-            "%.1f" % (print_length / 20),
-            "sec."
-        )
-        print_length += (25 + 1)  # 2.5 cm of wasted tape before, 1 mm after
-        print(
-            "Length of the used tape (adding header and footer):",
-            "%.1f" % (print_length / 10),
-            "cm = %.1f" % (print_length / 10 / 2.54),
-            "in, printed in",
-            "%.1f" % (print_length / 20),
-            "sec."
-        )
-
-        # Check max tape length
-        if print_length > 499:
-            print("Print length exceeding 49.9 cm = 19.6 in")
-            quit()
-
-        # Image save and show
-        if args.save:
-            print(f'Saving image "{args.save}".')
-            image.save(args.save)
-            if args.no_print:
-                quit()
-        if args.show:
-            try:
-                image.show()
-            except Exception as e:
-                p.error("Cannot show image:" + repr(e))
-            if not args.show_conv and args.no_print:
-                quit()
-        if args.show_conv:
-            padded.show()
-            if args.no_print:
-                quit()
-
-        data = padded.tobytes()
-
-    # Similar to main() in labelmaker.py
-    try:
-        ser = serial.Serial(args.comport)
-    except serial.SerialException:
-        p.error(
-            'Printer on Bluetooth serial port "'
-            + args.comport
-            + '" is unavailable or unreachable.'
-        )
-    except Exception as e:
-        p.error(e)
-
-    try:
-        assert data is not None
-        do_print_job(ser, args, data)
-    finally:
-        # Initialize
-        reset_printer(ser)
+        try:
+            assert data is not None
+            do_print_job(ser, args, data)
+        finally:
+            reset_printer(ser)
+            ser.close()
 
 if __name__ == "__main__":
     main()

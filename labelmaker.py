@@ -24,6 +24,25 @@ def parse_args():
     p.add_argument('-C', '--nocomp', help='Disable compression.', action='store_true')
     return p, p.parse_args()
 
+def drain_until_ready(ser, verbose=False):
+    original_timeout = ser.timeout
+    ser.timeout = 10.0
+    try:
+        while True:
+            buf = ser.read(32)
+            if len(buf) != 32:
+                print("  drain: timeout waiting for Ready", file=sys.stderr)
+                return
+            s = ptstatus.unpack_status(buf)
+            if verbose:
+                print(f"  drain: status_type=0x{s.status_type:02x} "
+                      f"phase_type=0x{s.phase_type:02x} phase=0x{s.phase:04x} "
+                      f"err=0x{s.err:04x}", file=sys.stderr)
+            if s.phase_type == 0 and s.phase == 0:
+                return
+    finally:
+        ser.timeout = original_timeout
+
 def reset_printer(ser):
     # Flush print buffer
     ser.write(b"\x00" * 64)
@@ -110,12 +129,8 @@ def do_print_job(ser, args, data):
     print("=> Image data was sent successfully. Printing will begin soon.")
 
     if not args.no_print:
-        # Print and feed
         ser.write(ptcbp.serialize_control('print'))
-
-        # Dump status that the printer returns
-        status = ptstatus.unpack_status(ser.read(32))
-        ptstatus.print_status(status)
+        drain_until_ready(ser, verbose=getattr(args, 'verbose', False))
 
     print("=> All done.")
 
