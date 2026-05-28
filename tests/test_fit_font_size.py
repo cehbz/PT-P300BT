@@ -2,8 +2,8 @@ import pytest
 from PIL import ImageFont
 
 from printlabel import fit_font_size, calculate_multiline_dimensions
+from tests.conftest import FONT
 
-FONT = "Roboto_Condensed-Bold"
 PRINTABLE_HEIGHT = 64
 
 

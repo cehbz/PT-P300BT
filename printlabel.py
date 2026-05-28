@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from pdf2image import convert_from_path
 
 from labelmaker import do_print_job, reset_printer
+from labelmaker_encode import read_png
 import ptcbp
 import ptstatus
     
@@ -408,17 +409,20 @@ def fit_font_size(fontname, text_lines, max_width_px=None,
 def pick_uniform_font_size(fontname, labels, max_width_mm,
                            base_line_spacing=1.2, height_limit=64, p=None):
     """Find the largest font_size where every label fits within
-    (max_width_mm, height_limit). Errors via p.error (or raises ValueError if
-    p is None) when any label doesn't fit at any size >= 1.
-    Returns (font_size, line_spacing) for uniform rendering.
+    (max_width_mm, height_limit), plus the loosest line_spacing every label
+    tolerates at that size.
+
+    Errors via p.error (or raises ValueError if p is None) when any label
+    doesn't fit at any size >= 1.
     """
     max_width_px = int(max_width_mm / 0.149)
     sizes = []
-    spacings = []
+    text_lines_list = []
     for text in labels:
         text_lines = (text.replace("\\n", "\n").split('\n')
                       if '\\n' in text else [text])
-        size, spacing = fit_font_size(
+        text_lines_list.append(text_lines)
+        size, _ = fit_font_size(
             fontname, text_lines,
             max_width_px=max_width_px,
             base_line_spacing=base_line_spacing,
@@ -432,12 +436,38 @@ def pick_uniform_font_size(fontname, labels, max_width_mm,
             else:
                 raise ValueError(msg)
         sizes.append(size)
-        spacings.append(spacing)
-    return min(sizes), min(spacings)
+
+    uniform_size = min(sizes)
+    # At uniform_size most labels have more room than at their per-label max,
+    # so re-fit each one and take the tightest spacing actually required across
+    # the batch (rather than just min over per-label-max spacings, which can be
+    # tighter than needed).
+    font = ImageFont.truetype(fontname, uniform_size, encoding='utf-8')
+    min_spacing_floor = base_line_spacing * 0.9
+    uniform_spacing = base_line_spacing
+    for text_lines in text_lines_list:
+        if len(text_lines) <= 1:
+            continue
+        _, h, _ = calculate_multiline_dimensions(text_lines, font, base_line_spacing)
+        if h <= height_limit:
+            continue
+        spacing = base_line_spacing
+        while spacing > min_spacing_floor:
+            spacing -= 0.01
+            _, h2, _ = calculate_multiline_dimensions(text_lines, font, spacing)
+            if h2 <= height_limit:
+                break
+        uniform_spacing = min(uniform_spacing, spacing)
+    return uniform_size, uniform_spacing
 
 
-def render_label(args, text, p):
-    """Render a text label to binary image data ready for the printer."""
+def render_label(args, text, p, save_path=None):
+    """Render a text label to binary image data ready for the printer.
+
+    If save_path is set, writes the unconverted image to that path. Caller
+    owns any decision to exit after rendering (this function does not call
+    quit()/sys.exit).
+    """
     height_of_the_printable_area = 64  # px: number of vertical pixels of the PT-P300BT printer (9 mm)
     height_of_the_tape = 86  # 64 px / 9 mm * 12 mm (the borders over the printable area will not be printed)
     height_of_the_image = 88  # px (can be any value >= height_of_the_tape, but height_of_the_tape + 2 border lines is good)
@@ -460,16 +490,16 @@ def render_label(args, text, p):
 
             if args.fixed_font_size:
                 font_size = args.fixed_font_size
+                line_spacing = args.line_spacing
                 font = ImageFont.truetype(args.fontname, font_size, encoding='utf-8')
                 font_width, font_height, line_heights = calculate_multiline_dimensions(
-                    text_lines, font, args.line_spacing
+                    text_lines, font, line_spacing
                 )
                 if font_height > height_of_the_printable_area:
                     print(f"Warning: fixed font size {font_size} exceeds printable area ({font_height} > {height_of_the_printable_area})")
             else:
-                original_spacing = args.line_spacing
                 max_width_px = int(args.max_width / 0.149) if args.max_width else None
-                font_size, args.line_spacing = fit_font_size(
+                font_size, line_spacing = fit_font_size(
                     args.fontname, text_lines,
                     max_width_px=max_width_px,
                     base_line_spacing=args.line_spacing,
@@ -477,36 +507,36 @@ def render_label(args, text, p):
                 )
                 if font_size == 0:
                     p.error(f'Text "{text}" does not fit at any font size')
-                if args.line_spacing < original_spacing:
+                if line_spacing < args.line_spacing:
                     print(
                         f"Line spacing has been slightly decreased to fit "
-                        f"the printable area. Used value: {args.line_spacing:.2f}."
+                        f"the printable area. Used value: {line_spacing:.2f}."
                     )
-                try:
-                    font = ImageFont.truetype(
-                        args.fontname, font_size, encoding='utf-8'
-                    )
-                except Exception as e:
-                    p.error(f'Cannot load font "{args.fontname}" - {e}')
-                font_width, font_height, line_heights = calculate_multiline_dimensions(
-                    text_lines, font, args.line_spacing
+                font = ImageFont.truetype(
+                    args.fontname, font_size, encoding='utf-8'
                 )
+                font_width, font_height, line_heights = calculate_multiline_dimensions(
+                    text_lines, font, line_spacing
+                )
+                if font_height < height_of_the_printable_area:
+                    print(
+                        f'Note: max height of this text with font '
+                        f'"{args.fontname}" is {font_height} dots instead of '
+                        f'{height_of_the_printable_area}.'
+                    )
 
             y_position = print_border
             if args.font_scale:
                 scaled_font_size = int(
                     round(font_size * (args.font_scale / 100.0))
                 )
-                try:
-                    font = ImageFont.truetype(
-                        args.fontname, scaled_font_size, encoding='utf-8'
-                    )
-                except Exception as e:
-                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font = ImageFont.truetype(
+                    args.fontname, scaled_font_size, encoding='utf-8'
+                )
 
                 # Recalculate dimensions with scaled font
                 font_width, font_height, line_heights = calculate_multiline_dimensions(
-                    text_lines, font, args.line_spacing
+                    text_lines, font, line_spacing
                 )
 
                 # Vertically center text
@@ -528,7 +558,7 @@ def render_label(args, text, p):
                 # Draw multiline text
                 draw_multiline_text(
                     draw, text_lines, args.h_padding, y_position + args.v_shift,
-                    font, args.fill, args.stroke_width, args.stroke_fill, args.line_spacing,
+                    font, args.fill, args.stroke_width, args.stroke_fill, line_spacing,
                     args.center_text, image.width
                 )
             except Exception as e:
@@ -570,25 +600,25 @@ def render_label(args, text, p):
                 )
                 if font_size == 0:
                     p.error(f'Text "{text}" does not fit at any font size')
-                try:
-                    font = ImageFont.truetype(
-                        args.fontname, font_size, encoding='utf-8'
-                    )
-                except Exception as e:
-                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font = ImageFont.truetype(
+                    args.fontname, font_size, encoding='utf-8'
+                )
                 font_width, font_height = font.getbbox(text, anchor="lt")[2:]
+                if font_height < height_of_the_printable_area:
+                    print(
+                        f'Note: max height of this text with font '
+                        f'"{args.fontname}" is {font_height} dots instead of '
+                        f'{height_of_the_printable_area}.'
+                    )
 
             y_position = print_border
             if args.font_scale:
                 scaled_font_size = int(
                     round(font_size * (args.font_scale / 100.0))
                 )
-                try:
-                    font = ImageFont.truetype(
-                        args.fontname, scaled_font_size, encoding='utf-8'
-                    )
-                except Exception as e:
-                    p.error(f'Cannot load font "{args.fontname}" - {e}')
+                font = ImageFont.truetype(
+                    args.fontname, scaled_font_size, encoding='utf-8'
+                )
                 font_width, font_height = font.getbbox(text, anchor="lt")[2:]
 
                 # Vertically center text
@@ -795,28 +825,35 @@ def render_label(args, text, p):
 
     # Check max tape length
     if print_length > 499:
-        print("Print length exceeding 49.9 cm = 19.6 in")
-        quit()
+        p.error(
+            f'Print length {print_length / 10:.1f} cm exceeds the printer '
+            f'maximum of 49.9 cm.'
+        )
 
-    # Image save and show
-    if args.save:
-        print(f'Saving image "{args.save}".')
-        image.save(args.save)
-        if args.no_print:
-            quit()
+    # Image save and show. quit()/sys.exit decisions are the caller's.
+    if save_path:
+        print(f'Saving image "{save_path}".')
+        image.save(save_path)
     if args.show:
         try:
             image.show()
         except Exception as e:
             p.error("Cannot show image:" + repr(e))
-        if not args.show_conv and args.no_print:
-            quit()
     if args.show_conv:
         padded.show()
-        if args.no_print:
-            quit()
 
     return padded.tobytes()
+
+
+def _batch_save_path(template, index, total):
+    """Return per-label save path for batch mode: 'out.png' + index 2 -> 'out_002.png'."""
+    if template is None:
+        return None
+    stem, _, ext = template.rpartition('.')
+    if not stem:
+        stem, ext = template, ''
+    width = max(3, len(str(total)))
+    return f"{stem}_{index + 1:0{width}d}.{ext}" if ext else f"{stem}_{index + 1:0{width}d}"
 
 
 def main():
@@ -825,13 +862,22 @@ def main():
     if args.comport not in [p.device for p in list_ports.comports()]:
         print("Port '" + args.comport + "' does not seem a valid serial communication port.")
 
+    # Validate --max-width / --text-size incompatibility + positivity.
     if args.max_width and args.text_size:
         p.error("--max-width and --text-size are incompatible (one caps width, the other stretches to width)")
+    if args.max_width is not None and args.max_width <= 0:
+        p.error("--max-width must be positive")
+
+    # Fail-fast: confirm the font is loadable. All later truetype calls assume success.
+    try:
+        ImageFont.truetype(args.fontname, 10, encoding='utf-8')
+    except OSError as e:
+        p.error(f'Cannot load font "{args.fontname}": {e}')
 
     if args.batch_file:
-        # Batch mode: read labels from file, render all, then print in one session
+        # Batch mode: read labels from file, render all, then print in one session.
         with open(args.batch_file) as f:
-            labels = [line.rstrip('\n') for line in f if line.strip()]
+            labels = [line.rstrip('\r\n') for line in f if line.strip()]
 
         if not labels:
             p.error(f'No labels found in "{args.batch_file}".')
@@ -849,8 +895,16 @@ def main():
         rendered = []
         for i, text in enumerate(labels):
             print(f"\n--- Label {i+1}/{len(labels)}: {text} ---")
-            data = render_label(args, text, p)
+            save_path = _batch_save_path(args.save, i, len(labels))
+            data = render_label(args, text, p, save_path=save_path)
             rendered.append(data)
+
+        if args.no_print:
+            return
+
+        # Batch feed semantics: never feed between labels regardless of -F.
+        # -F applies to the final label (suppress final feed); default is feed at end.
+        user_no_feed = args.no_feed
 
         print(f"\n=> Opening printer connection and printing {len(rendered)} labels...")
         try:
@@ -868,21 +922,23 @@ def main():
             for i, data in enumerate(rendered):
                 is_last = (i == len(rendered) - 1)
                 print(f"\n=> Printing label {i+1}/{len(rendered)}...")
-                args.no_feed = not is_last
+                args.no_feed = user_no_feed or not is_last
                 do_print_job(ser, args, data)
         finally:
             reset_printer(ser)
             ser.close()
 
     else:
-        # Single label mode
-        data = None
-        if args.image is None:
-            text = " ".join(args.text_to_print)
-            data = render_label(args, text, p)
+        # Single label mode.
+        if args.image is not None:
+            data = (read_png(args.image, False, False, False)
+                    if args.raw else read_png(args.image))
         else:
-            # Legacy image mode handled by labelmaker
-            pass
+            text = " ".join(args.text_to_print)
+            data = render_label(args, text, p, save_path=args.save)
+
+        if args.no_print:
+            return
 
         try:
             ser = serial.Serial(args.comport)
@@ -896,7 +952,6 @@ def main():
             p.error(e)
 
         try:
-            assert data is not None
             do_print_job(ser, args, data)
         finally:
             reset_printer(ser)

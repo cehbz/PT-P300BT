@@ -24,21 +24,33 @@ def parse_args():
     p.add_argument('-C', '--nocomp', help='Disable compression.', action='store_true')
     return p, p.parse_args()
 
-def drain_until_ready(ser, verbose=False):
+def drain_until_ready(ser, expected_print_s=0.0, verbose=False):
+    """Read status frames until phase_type=0 AND phase=0 (Ready).
+
+    timeout scales with the expected print duration (the printer can take
+    several seconds for long labels before emitting the Ready frame).
+    Raises TimeoutError if Ready never arrives. Prints the final frame's
+    full status if err != 0 (regardless of verbose).
+    """
+    timeout = max(10.0, expected_print_s * 2 + 5)
     original_timeout = ser.timeout
-    ser.timeout = 10.0
+    ser.timeout = timeout
     try:
         while True:
             buf = ser.read(32)
             if len(buf) != 32:
-                print("  drain: timeout waiting for Ready", file=sys.stderr)
-                return
+                raise TimeoutError(
+                    f"drain: no Ready frame within {timeout:.1f}s")
             s = ptstatus.unpack_status(buf)
             if verbose:
                 print(f"  drain: status_type=0x{s.status_type:02x} "
                       f"phase_type=0x{s.phase_type:02x} phase=0x{s.phase:04x} "
                       f"err=0x{s.err:04x}", file=sys.stderr)
             if s.phase_type == 0 and s.phase == 0:
+                if s.err != 0:
+                    print("** Printer reported errors after print:",
+                          file=sys.stderr)
+                    ptstatus.print_status(s)
                 return
     finally:
         ser.timeout = original_timeout
@@ -130,7 +142,13 @@ def do_print_job(ser, args, data):
 
     if not args.no_print:
         ser.write(ptcbp.serialize_control('print'))
-        drain_until_ready(ser, verbose=getattr(args, 'verbose', False))
+        # Print speed is 20 mm/sec at 180 DPI; raster_lines * 0.149 mm/line.
+        expected_print_s = raster_lines * 0.149 / 20.0
+        drain_until_ready(
+            ser,
+            expected_print_s=expected_print_s,
+            verbose=getattr(args, 'verbose', False),
+        )
 
     print("=> All done.")
 
