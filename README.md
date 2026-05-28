@@ -67,7 +67,7 @@ python printlabel.py -sl COM3 arial.ttf "Line 1\nLine 2\nLine 3"
 
 ```
 usage: printlabel.py [-h] [--fixed-width MILLIMETERS] [--fixed-font-size SIZE]
-                     [-W MILLIMETERS] [-B FILE] [-u] [-l] [-s] [-c]
+                     [-W MILLIMETERS] [-v] [-B FILE] [-u] [-l] [-s] [-c]
                      [-i FILE_NAME] [-M FILE_NAME] [-R FLOAT] [-X DOTS] [-Y DOTS]
                      [-S FILE_NAME] [-n] [-F] [-a] [-m DOTS] [-r] [-C]
                      [--fill-color FILL] [--stroke-fill STROKE_FILL]
@@ -98,10 +98,12 @@ Optional arguments:
                         font size that fits every label within this width and errors
                         if any label can't fit at any size. Incompatible with
                         --text-size.
+  -v, --verbose         Print per-frame status diagnostics during printing.
   -B, --batch-file FILE
-                        Print multiple labels from a file (one label per line). Uses
-                        chain printing to minimize tape waste. Each line uses \n for
-                        line breaks within a label.
+                        Print multiple labels from a file in one serial session
+                        (one label per line, use \n for line breaks within a label).
+                        Always chains between labels (no inter-label feed);
+                        feeds at end unless -F is also set.
   -u, --unicode         Use Unicode escape sequences in TEXT_TO_PRINT.
   -l, --lines           Add horizontal lines for drawing area (dotted red) and tape
                         (cyan).
@@ -119,10 +121,12 @@ Optional arguments:
   -Y DOTS, --y-merge DOTS
                         With image merge, shift down the image of Y dots.
   -S FILE_NAME, --save FILE_NAME
-                        Save the produced image to a PNG file.
+                        Save the produced image to a PNG file. In batch mode (-B),
+                        filenames are auto-numbered (out.png -> out_001.png, ...).
   -n, --no-print        Only configure the printer and send the image but do not send
                         print command.
-  -F, --no-feed         Disable feeding at the end of the print (chaining).
+  -F, --no-feed         No feed at end of print. In batch mode (-B), suppresses
+                        the final feed only (batch always chains between labels).
   -a, --auto-cut        Enable auto-cutting (or print label boundary on e.g. PT-P300BT).
   -m DOTS, --end-margin DOTS
                         End margin (in dots).
